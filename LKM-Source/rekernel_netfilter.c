@@ -82,7 +82,7 @@ static inline uid_t line_sock2uid(struct sock *sk)
 		return 0;
 }
 
-static bool monitor_all = true;
+static bool monitor_all = false;
 module_param(monitor_all, bool, 0644);
 MODULE_PARM_DESC(monitor_all, "Report events for every app uid without MONITOR_NET subscription");
 
