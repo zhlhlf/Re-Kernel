@@ -18,6 +18,7 @@
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/tcp.h>
+#include <linux/udp.h>
 #include <net/rtnetlink.h>
 #include "rekernel_internal.h"
 
@@ -81,25 +82,39 @@ static inline uid_t line_sock2uid(struct sock *sk)
 		return 0;
 }
 
-static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket_buffer,
+static bool monitor_all = true;
+module_param(monitor_all, bool, 0644);
+MODULE_PARM_DESC(monitor_all, "Report events for every app uid without MONITOR_NET subscription");
+
+static unsigned int min_payload = 1024;
+module_param(min_payload, uint, 0644);
+MODULE_PARM_DESC(min_payload, "Minimum L4 payload bytes to report; 0 reports every packet");
+
+static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_buffer,
    const struct nf_hook_state *state)
 {
   struct sock *sk;
   unsigned int thoff = 0;
   unsigned short frag_off = 0;
   uid_t uid;
-  uint hook;
   struct net_device *dev = NULL;
-  struct tcphdr *th;
-  int data_len = 0;
-  bool monitored;
+  const char *dir;
+  int data_len;
+  int l4proto;
+  bool monitored = false;
 
   if (!socket_buffer || !socket_buffer->len || !state)
    return NF_ACCEPT;
 
-  hook = state->hook;
-  if (NF_INET_LOCAL_IN == hook)
+  if (NF_INET_LOCAL_IN == state->hook) {
    dev = state->in;
+   dir = "in";
+  } else if (NF_INET_LOCAL_OUT == state->hook) {
+   dev = state->out;
+   dir = "out";
+  } else {
+   return NF_ACCEPT;
+  }
 
   if (NULL == dev)
    return NF_ACCEPT;
@@ -111,10 +126,12 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
   uid = line_sock2uid(sk);
   if (uid < MIN_USERAPP_UID) return NF_ACCEPT;
 
-  rcu_read_lock();
-  monitored = net_uid_monitored(uid);
-  rcu_read_unlock();
-  if (!monitored) return NF_ACCEPT;
+  if (!monitor_all) {
+   rcu_read_lock();
+   monitored = net_uid_monitored(uid);
+   rcu_read_unlock();
+   if (!monitored) return NF_ACCEPT;
+  }
 
   if (ip_hdr(socket_buffer)->version == 4) {
    struct iphdr *iph4;
@@ -125,18 +142,29 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
    }
 
    iph4 = ip_hdr(socket_buffer);
-   if (iph4->protocol != IPPROTO_TCP) {
+   l4proto = iph4->protocol;
+   if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP) {
     return NF_ACCEPT;
    }
 
    ip_hdr_len = iph4->ihl << 2;
-   if (!pskb_may_pull(socket_buffer, ip_hdr_len + sizeof(struct tcphdr))) {
-    return NF_ACCEPT;
+   if (l4proto == IPPROTO_TCP) {
+    struct tcphdr *th;
+    if (!pskb_may_pull(socket_buffer, ip_hdr_len + sizeof(struct tcphdr))) {
+     return NF_ACCEPT;
+    }
+    iph4 = ip_hdr(socket_buffer);
+    th = (struct tcphdr *)((unsigned char *)iph4 + ip_hdr_len);
+    data_len = ntohs(iph4->tot_len) - ip_hdr_len - (th->doff << 2);
+   } else {
+    struct udphdr *uh;
+    if (!pskb_may_pull(socket_buffer, ip_hdr_len + sizeof(struct udphdr))) {
+     return NF_ACCEPT;
+    }
+    iph4 = ip_hdr(socket_buffer);
+    uh = (struct udphdr *)((unsigned char *)iph4 + ip_hdr_len);
+    data_len = ntohs(uh->len) - sizeof(struct udphdr);
    }
-
-   iph4 = ip_hdr(socket_buffer);
-   th = (struct tcphdr *)((unsigned char *)iph4 + ip_hdr_len);
-   data_len = ntohs(iph4->tot_len) - ip_hdr_len - (th->doff << 2);
 
 #if IS_ENABLED(CONFIG_IPV6)
   } else if (ip_hdr(socket_buffer)->version == 6) {
@@ -146,59 +174,78 @@ static unsigned int rekernel_pkg_ipv4_ipv6_in(void *priv, struct sk_buff *socket
     return NF_ACCEPT;
    }
 
-   if (ipv6_find_hdr(socket_buffer, &thoff, -1, &frag_off, NULL) != IPPROTO_TCP) {
-    return NF_ACCEPT;
-   }
-
-   if (!pskb_may_pull(socket_buffer, thoff + sizeof(struct tcphdr))) {
+   l4proto = ipv6_find_hdr(socket_buffer, &thoff, -1, &frag_off, NULL);
+   if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP) {
     return NF_ACCEPT;
    }
 
    iph6 = ipv6_hdr(socket_buffer);
-   th = (struct tcphdr *)(skb_network_header(socket_buffer) + thoff);
-   data_len = ntohs(iph6->payload_len) - (thoff - sizeof(struct ipv6hdr)) - (th->doff << 2);
+   if (l4proto == IPPROTO_TCP) {
+    struct tcphdr *th;
+    if (!pskb_may_pull(socket_buffer, thoff + sizeof(struct tcphdr))) {
+     return NF_ACCEPT;
+    }
+    th = (struct tcphdr *)(skb_network_header(socket_buffer) + thoff);
+    data_len = ntohs(iph6->payload_len) - (thoff - sizeof(struct ipv6hdr)) - (th->doff << 2);
+   } else {
+    struct udphdr *uh;
+    if (!pskb_may_pull(socket_buffer, thoff + sizeof(struct udphdr))) {
+     return NF_ACCEPT;
+    }
+    uh = (struct udphdr *)(skb_network_header(socket_buffer) + thoff);
+    data_len = ntohs(uh->len) - sizeof(struct udphdr);
+   }
 #endif
   } else {
    return NF_ACCEPT;
   }
 
-  if (data_len <= 0 && !th->syn && !th->fin && !th->rst)
+  /* 纯 ACK/握手（无 payload）不报；同时按 min_payload 过滤小包，避免刷屏 */
+  if (data_len <= 0 || (min_payload && (unsigned int)data_len < min_payload))
    return NF_ACCEPT;
 
 #ifdef DEBUG
-  pr_info("[Re-Kernel LKM] Receive net data! target=%d\n", uid);
+  pr_info("[Re-Kernel LKM] net %s uid=%d proto=%d len=%d\n", dir, uid, l4proto, data_len);
 #endif
   if (rekernel_netlink_ready()) {
    char binder_kmsg[PACKET_SIZE];
    int len;
-   if (ip_hdr(socket_buffer)->version == 4) {
-    len = scnprintf(binder_kmsg, sizeof(binder_kmsg), "type=Network,target=%d,proto=ipv4,data_len=%d;", uid, data_len);
-#if IS_ENABLED(CONFIG_IPV6)
-   } else if (ip_hdr(socket_buffer)->version == 6) {
-    len = scnprintf(binder_kmsg, sizeof(binder_kmsg), "type=Network,target=%d,proto=ipv6,data_len=%d;", uid, data_len);
-#endif
-   } else {
-    return NF_ACCEPT;
-   }
+
+   len = scnprintf(binder_kmsg, sizeof(binder_kmsg),
+     "type=Network,target=%d,proto=ipv%d,dir=%s,l4=%s,data_len=%d;",
+     uid, ip_hdr(socket_buffer)->version == 4 ? 4 : 6, dir,
+     l4proto == IPPROTO_TCP ? "tcp" : "udp", data_len);
    sendMessage(binder_kmsg, len);
   }
 
   return NF_ACCEPT;
 }
 
-/* Only monitor input network packages */
+/* Monitor both directions (LOCAL_IN / LOCAL_OUT), TCP and UDP */
 static struct nf_hook_ops rekernel_nf_ops[] = {
 	{
-		.hook     = rekernel_pkg_ipv4_ipv6_in,
+		.hook     = rekernel_pkg_ipv4_ipv6,
 		.pf       = NFPROTO_IPV4,
 		.hooknum  = NF_INET_LOCAL_IN,
 		.priority = NF_IP_PRI_SELINUX_LAST + 1,
 	},
+	{
+		.hook     = rekernel_pkg_ipv4_ipv6,
+		.pf       = NFPROTO_IPV4,
+		.hooknum  = NF_INET_LOCAL_OUT,
+		.priority = NF_IP_PRI_SELINUX_LAST + 1,
+	},
 #if IS_ENABLED(CONFIG_IPV6)
 	{
-		.hook     = rekernel_pkg_ipv4_ipv6_in,
+		.hook     = rekernel_pkg_ipv4_ipv6,
 		.pf       = NFPROTO_IPV6,
 		.hooknum  = NF_INET_LOCAL_IN,
+		.priority = NF_IP6_PRI_SELINUX_LAST + 1,
+	},
+	{
+		.hook     = rekernel_pkg_ipv4_ipv6,
+		.pf       = NFPROTO_IPV6,
+		.hooknum  = NF_INET_LOCAL_OUT,
 		.priority = NF_IP6_PRI_SELINUX_LAST + 1,
 	}
 #endif
