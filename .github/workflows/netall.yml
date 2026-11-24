@@ -1,0 +1,31 @@
+name: Build netall LKM (android14-6.1)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk:android14-6.1-20260313
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build rekernel.ko (all net)
+        run: |
+          set -e
+          KMI=android14-6.1
+          cp ./LKM-Source/*.c ./LKM-Source/*.h /opt/ddk/src/$KMI/drivers/android/
+          cat ./LKM-Source/Makefile >> /opt/ddk/src/$KMI/drivers/android/Makefile
+          cd /opt/ddk/src/$KMI
+          make -C /opt/ddk/kdir/$KMI \
+            M=/opt/ddk/src/$KMI/drivers/android \
+            CONFIG_REKERNEL=m CC=clang REKERNEL_VERSION="11.8-allnet" modules
+          mkdir -p /github/workspace/out
+          cp /opt/ddk/src/$KMI/drivers/android/rekernel.ko /github/workspace/out/rekernel-android14-6.1-netall.ko
+          llvm-strip -d /github/workspace/out/rekernel-android14-6.1-netall.ko
+          ls -l /github/workspace/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rekernel-netall
+          path: /github/workspace/out/*.ko
