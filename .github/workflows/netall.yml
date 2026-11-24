@@ -20,7 +20,7 @@ jobs:
           cd /opt/ddk/src/$KMI
           make -C /opt/ddk/kdir/$KMI \
             M=/opt/ddk/src/$KMI/drivers/android \
-            CONFIG_REKERNEL=m CC=clang REKERNEL_VERSION="11.8-sub" modules
+            CONFIG_REKERNEL=m CC=clang REKERNEL_VERSION="11.8-sub2" modules
           mkdir -p /github/workspace/out
           cp /opt/ddk/src/$KMI/drivers/android/rekernel.ko /github/workspace/out/rekernel-android14-6.1-netall.ko
           llvm-strip -d /github/workspace/out/rekernel-android14-6.1-netall.ko

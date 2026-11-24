@@ -88,7 +88,13 @@ MODULE_PARM_DESC(monitor_all, "Report events for every app uid without MONITOR_N
 
 static unsigned int min_payload = 1024;
 module_param(min_payload, uint, 0644);
-MODULE_PARM_DESC(min_payload, "Minimum L4 payload bytes to report; 0 reports every packet");
+MODULE_PARM_DESC(min_payload, "Minimum TCP payload bytes to report; 0 reports every TCP packet");
+
+/* UDP 单独阈值：视频通话的 RTC 私有协议单包普遍 600~1200B，用 TCP 的 1KB
+ * 会漏掉大部分上行包，所以默认放到 512。 */
+static unsigned int min_payload_udp = 512;
+module_param(min_payload_udp, uint, 0644);
+MODULE_PARM_DESC(min_payload_udp, "Minimum UDP payload bytes to report; 0 reports every UDP packet");
 
 static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_buffer,
    const struct nf_hook_state *state)
@@ -200,9 +206,12 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
    return NF_ACCEPT;
   }
 
-  /* 纯 ACK/握手（无 payload）不报；同时按 min_payload 过滤小包，避免刷屏 */
-  if (data_len <= 0 || (min_payload && (unsigned int)data_len < min_payload))
-   return NF_ACCEPT;
+  /* 纯 ACK/握手（无 payload）不报；同时按协议各自的阈值过滤小包，避免刷屏 */
+  {
+   unsigned int minp = (l4proto == IPPROTO_UDP) ? min_payload_udp : min_payload;
+   if (data_len <= 0 || (minp && (unsigned int)data_len < minp))
+    return NF_ACCEPT;
+  }
 
 #ifdef DEBUG
   pr_info("[Re-Kernel LKM] net %s uid=%d proto=%d len=%d\n", dir, uid, l4proto, data_len);
