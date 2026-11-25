@@ -19,6 +19,9 @@
 #include <net/ipv6.h>
 #include <net/tcp.h>
 #include <linux/udp.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/atomic.h>
 #include <net/rtnetlink.h>
 #include "rekernel_internal.h"
 
@@ -29,9 +32,14 @@ struct uid_info {
 	uid_t uid;
 	unsigned int min_payload;      /* 0 = 用模块默认 */
 	unsigned int min_payload_udp;  /* 0 = 用模块默认 */
+	atomic64_t bytes;              /* 本周期累计的 L4 payload 字节数 */
 	struct hlist_node hnode;
 	struct rcu_head rcu;
 };
+
+/* 统计窗口：每秒把各 uid 的累计字节数聚合上报一次 */
+#define REKERNEL_NET_STAT_MS 1000
+static struct timer_list rekernel_net_stat_timer;
 
 static DEFINE_MUTEX(rekernel_net_uid_mutex);
 
@@ -94,10 +102,59 @@ void net_uid_add(uid_t uid, unsigned int min_payload, unsigned int min_payload_u
 			entry->uid = uid;
 			entry->min_payload = min_payload;
 			entry->min_payload_udp = min_payload_udp;
+			atomic64_set(&entry->bytes, 0);
 			hash_add_rcu(rekernel_net_uid_map, &entry->hnode, uid);
 		}
 	}
 	mutex_unlock(&rekernel_net_uid_mutex);
+}
+
+/* 累加某个 uid 本窗口的字节数（调用者不要在 rcu 临界区里再调用） */
+void net_uid_account(uid_t uid, unsigned int bytes)
+{
+	struct uid_info *entry;
+
+	rcu_read_lock();
+	entry = net_uid_find_rcu(uid);
+	if (entry)
+		atomic64_add(bytes, &entry->bytes);
+	rcu_read_unlock();
+}
+
+/* 每秒把累计字节数发给用户态；没数据的 uid 不发 */
+static void rekernel_net_stat_flush(struct timer_list *t)
+{
+	struct uid_info *entry;
+	int bkt;
+	unsigned long long bytes;
+
+	mutex_lock(&rekernel_net_uid_mutex);
+	hash_for_each(rekernel_net_uid_map, bkt, entry, hnode) {
+		bytes = atomic64_xchg(&entry->bytes, 0);
+		if (bytes == 0)
+			continue;
+		if (rekernel_netlink_ready()) {
+			char stat_msg[96];
+			int len = scnprintf(stat_msg, sizeof(stat_msg),
+				"type=NetStat,target=%d,bytes=%llu;", entry->uid, bytes);
+			sendMessage(stat_msg, len);
+		}
+	}
+	mutex_unlock(&rekernel_net_uid_mutex);
+
+	mod_timer(t, jiffies + msecs_to_jiffies(REKERNEL_NET_STAT_MS));
+}
+
+int net_stat_start(void)
+{
+	timer_setup(&rekernel_net_stat_timer, rekernel_net_stat_flush, 0);
+	mod_timer(&rekernel_net_stat_timer, jiffies + msecs_to_jiffies(REKERNEL_NET_STAT_MS));
+	return LINE_SUCCESS;
+}
+
+void net_stat_stop(void)
+{
+	del_timer_sync(&rekernel_net_stat_timer);
 }
 
 /* remove a uid from the monitor map. Caller must NOT hold the mutex. */
@@ -123,6 +180,12 @@ static inline uid_t line_sock2uid(struct sock *sk)
 	else
 		return 0;
 }
+
+/* 每条报文的即时事件。默认关闭：改为每秒聚合上报（NetStat），
+ * 由用户态按 1 秒总字节数判断是否网络活跃，避免刷屏与误判。 */
+static bool packet_events = false;
+module_param(packet_events, bool, 0644);
+MODULE_PARM_DESC(packet_events, "Emit per-packet Network events (default 0, use 1s NetStat aggregation)");
 
 static bool monitor_all = false;
 module_param(monitor_all, bool, 0644);
@@ -249,6 +312,10 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
    return NF_ACCEPT;
   }
 
+  /* 统计：不管阈值过滤，先把本窗口的字节数累加（供 1s 聚合上报） */
+  if (data_len > 0)
+   net_uid_account(uid, (unsigned int)data_len);
+
   /* 纯 ACK/握手（无 payload）不报；同时按协议各自的阈值过滤小包，避免刷屏 */
   {
    unsigned int minp = (l4proto == IPPROTO_UDP)
@@ -261,15 +328,17 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
 #ifdef DEBUG
   pr_info("[Re-Kernel LKM] net %s uid=%d proto=%d len=%d\n", dir, uid, l4proto, data_len);
 #endif
-  if (rekernel_netlink_ready()) {
-   char binder_kmsg[PACKET_SIZE];
-   int len;
+  if (packet_events) {
+   if (rekernel_netlink_ready()) {
+    char binder_kmsg[PACKET_SIZE];
+    int len;
 
-   len = scnprintf(binder_kmsg, sizeof(binder_kmsg),
-     "type=Network,target=%d,proto=ipv%d,dir=%s,l4=%s,data_len=%d;",
-     uid, ip_hdr(socket_buffer)->version == 4 ? 4 : 6, dir,
-     l4proto == IPPROTO_TCP ? "tcp" : "udp", data_len);
-   sendMessage(binder_kmsg, len);
+    len = scnprintf(binder_kmsg, sizeof(binder_kmsg),
+      "type=Network,target=%d,proto=ipv%d,dir=%s,l4=%s,data_len=%d;",
+      uid, ip_hdr(socket_buffer)->version == 4 ? 4 : 6, dir,
+      l4proto == IPPROTO_TCP ? "tcp" : "udp", data_len);
+    sendMessage(binder_kmsg, len);
+   }
   }
 
   return NF_ACCEPT;

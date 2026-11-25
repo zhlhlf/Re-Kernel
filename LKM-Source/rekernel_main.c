@@ -37,6 +37,8 @@ static int __init start_rekernel(void)
 		goto unregister_signal_hook;
 	}
 
+	net_stat_start();
+
 #ifdef CLEAN_UP_ASYNC_BINDER
 	if (register_binder_cleanup() != LINE_SUCCESS) {
 		pr_err("%s: Failed to hook binder async cleanup!\n", __func__);
@@ -52,6 +54,7 @@ unregister_netfilter_hook:
 #endif
 	unregister_netfilter();
 unregister_signal_hook:
+	net_stat_stop();
 	unregister_signal();
 unregister_binder_hook:
 	unregister_binder();
@@ -66,6 +69,7 @@ static void __exit exit_rekernel(void)
 #ifdef CLEAN_UP_ASYNC_BINDER
 	unregister_binder_cleanup();
 #endif
+	net_stat_stop();
 	unregister_netfilter();
 	unregister_signal();
 	unregister_binder();

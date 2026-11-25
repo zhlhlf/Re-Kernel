@@ -64,6 +64,9 @@ void rekernel_netlink_stop(void);
 
 /* ---- network-monitor uid map (rekernel_netfilter.c) ---- */
 void net_uid_add(uid_t uid, unsigned int min_payload, unsigned int min_payload_udp);
+void net_uid_account(uid_t uid, unsigned int bytes);
+int net_stat_start(void);
+void net_stat_stop(void);
 void net_uid_del(uid_t uid);
 bool net_uid_thresholds(uid_t uid, unsigned int *min_payload, unsigned int *min_payload_udp);
 
