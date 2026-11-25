@@ -46,11 +46,6 @@ static struct uid_info *net_uid_find(uid_t uid)
 	return NULL;
 }
 
-static bool net_uid_monitored(uid_t uid)
-{
-	return net_uid_find(uid) != NULL;
-}
-
 /* 取某个 uid 的阈值；未订阅返回 false。0 表示用模块默认值。 */
 bool net_uid_thresholds(uid_t uid, unsigned int *min_payload, unsigned int *min_payload_udp)
 {
