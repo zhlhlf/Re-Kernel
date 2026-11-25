@@ -22,6 +22,7 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/atomic.h>
+#include <linux/jhash.h>
 #include <net/rtnetlink.h>
 #include "rekernel_internal.h"
 
@@ -36,6 +37,8 @@ struct uid_info {
 	struct hlist_node hnode;
 	struct rcu_head rcu;
 };
+
+static void flow_sweep(void);
 
 /* 统计窗口：每秒把各 uid 的累计字节数聚合上报一次 */
 #define REKERNEL_NET_STAT_MS 1000
@@ -142,6 +145,8 @@ static void rekernel_net_stat_flush(struct timer_list *t)
 	}
 	mutex_unlock(&rekernel_net_uid_mutex);
 
+	flow_sweep();
+
 	mod_timer(t, jiffies + msecs_to_jiffies(REKERNEL_NET_STAT_MS));
 }
 
@@ -171,6 +176,196 @@ void net_uid_del(uid_t uid)
 		}
 	}
 	mutex_unlock(&rekernel_net_uid_mutex);
+}
+
+/*
+ * 入向归属兜底：LOCAL_IN 上很多包（尤其未 connect 的 UDP/QUIC socket）还没挂 sk，
+ * skb_to_full_sk() 拿不到 socket，就查不到 uid。这里在 LOCAL_OUT（一定有 sk）
+ * 记录 5 元组 -> uid，入向按反向 5 元组取回，从而覆盖 QUIC/HTTP3 等 UDP 下载。
+ */
+#define REKERNEL_FLOW_HASH_BITS 9
+#define REKERNEL_FLOW_MAX 8192
+#define REKERNEL_FLOW_TTL_JIFFIES (300 * HZ)
+#define REKERNEL_FLOW_TUPLE_LEN 38 /* 16 saddr + 16 daddr + 2 sport + 2 dport + 1 proto + 1 family */
+
+struct flow_entry {
+	u8 tuple[REKERNEL_FLOW_TUPLE_LEN];
+	uid_t uid;
+	unsigned long expires;
+	struct hlist_node hnode;
+	struct rcu_head rcu;
+};
+
+static DEFINE_HASHTABLE(rekernel_flow_map, REKERNEL_FLOW_HASH_BITS);
+static DEFINE_SPINLOCK(rekernel_flow_lock);
+static atomic_t rekernel_flow_cnt = ATOMIC_INIT(0);
+
+/* 调试：入向实在无法归属时打一条（限速） */
+static unsigned long last_unresolved_log;
+static bool debug_unresolved = false;
+module_param(debug_unresolved, bool, 0644);
+MODULE_PARM_DESC(debug_unresolved, "Log inbound packets whose uid cannot be resolved (rate limited)");
+
+static bool flow_build_tuple(struct sk_buff *skb, u8 *tuple, bool reverse)
+{
+	unsigned int thoff = 0;
+	unsigned short frag = 0;
+	int l4;
+	__be16 sport = 0, dport = 0;
+	u8 fam;
+
+	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+		return false;
+
+	if (ip_hdr(skb)->version == 4) {
+		struct iphdr *iph = ip_hdr(skb);
+		unsigned int ihl = iph->ihl << 2;
+
+		fam = 4;
+		l4 = iph->protocol;
+		if (l4 == IPPROTO_TCP) {
+			struct tcphdr *th;
+			if (!pskb_may_pull(skb, ihl + sizeof(*th)))
+				return false;
+			th = (struct tcphdr *)((unsigned char *)ip_hdr(skb) + ihl);
+			sport = th->source;
+			dport = th->dest;
+		} else if (l4 == IPPROTO_UDP) {
+			struct udphdr *uh;
+			if (!pskb_may_pull(skb, ihl + sizeof(*uh)))
+				return false;
+			uh = (struct udphdr *)((unsigned char *)ip_hdr(skb) + ihl);
+			sport = uh->source;
+			dport = uh->dest;
+		} else {
+			return false;
+		}
+
+		memset(tuple, 0, REKERNEL_FLOW_TUPLE_LEN);
+		memcpy(tuple, &iph->saddr, 4);
+		memcpy(tuple + 16, &iph->daddr, 4);
+	} else if (ip_hdr(skb)->version == 6) {
+		struct ipv6hdr *iph6;
+
+		l4 = ipv6_find_hdr(skb, &thoff, -1, &frag, NULL);
+		fam = 6;
+		if (l4 == IPPROTO_TCP) {
+			struct tcphdr *th;
+			if (!pskb_may_pull(skb, thoff + sizeof(*th)))
+				return false;
+			th = (struct tcphdr *)(skb_network_header(skb) + thoff);
+			sport = th->source;
+			dport = th->dest;
+		} else if (l4 == IPPROTO_UDP) {
+			struct udphdr *uh;
+			if (!pskb_may_pull(skb, thoff + sizeof(*uh)))
+				return false;
+			uh = (struct udphdr *)(skb_network_header(skb) + thoff);
+			sport = uh->source;
+			dport = uh->dest;
+		} else {
+			return false;
+		}
+
+		iph6 = ipv6_hdr(skb);
+		memset(tuple, 0, REKERNEL_FLOW_TUPLE_LEN);
+		memcpy(tuple, &iph6->saddr, 16);
+		memcpy(tuple + 16, &iph6->daddr, 16);
+	} else {
+		return false;
+	}
+
+	memcpy(tuple + 32, &sport, 2);
+	memcpy(tuple + 34, &dport, 2);
+	tuple[36] = (u8)l4;
+	tuple[37] = fam;
+
+	if (reverse) {
+		u8 tmp[16];
+		memcpy(tmp, tuple, 16);
+		memcpy(tuple, tuple + 16, 16);
+		memcpy(tuple + 16, tmp, 16);
+		memcpy(tmp, tuple + 32, 2);
+		memcpy(tuple + 32, tuple + 34, 2);
+		memcpy(tuple + 34, tmp, 2);
+	}
+	return true;
+}
+
+/* 出向：记录 5 元组 -> uid，已存在则刷新 */
+static void flow_record(struct sk_buff *skb, uid_t uid)
+{
+	struct flow_entry *e;
+	u8 tuple[REKERNEL_FLOW_TUPLE_LEN];
+	u32 hash;
+
+	if (!flow_build_tuple(skb, tuple, false))
+		return;
+	hash = jhash(tuple, REKERNEL_FLOW_TUPLE_LEN, 0);
+
+	spin_lock_bh(&rekernel_flow_lock);
+	hash_for_each_possible(rekernel_flow_map, e, hnode, hash) {
+		if (memcmp(e->tuple, tuple, REKERNEL_FLOW_TUPLE_LEN) == 0) {
+			e->uid = uid;
+			e->expires = jiffies + REKERNEL_FLOW_TTL_JIFFIES;
+			spin_unlock_bh(&rekernel_flow_lock);
+			return;
+		}
+	}
+	if (atomic_read(&rekernel_flow_cnt) >= REKERNEL_FLOW_MAX) {
+		spin_unlock_bh(&rekernel_flow_lock);
+		return;
+	}
+	e = kmalloc(sizeof(*e), GFP_ATOMIC);
+	if (e) {
+		memcpy(e->tuple, tuple, REKERNEL_FLOW_TUPLE_LEN);
+		e->uid = uid;
+		e->expires = jiffies + REKERNEL_FLOW_TTL_JIFFIES;
+		hash_add(rekernel_flow_map, &e->hnode, hash);
+		atomic_inc(&rekernel_flow_cnt);
+	}
+	spin_unlock_bh(&rekernel_flow_lock);
+}
+
+/* 入向：按反向 5 元组查 uid；查不到返回 0 */
+static uid_t flow_lookup_uid(struct sk_buff *skb)
+{
+	struct flow_entry *e;
+	u8 tuple[REKERNEL_FLOW_TUPLE_LEN];
+	u32 hash;
+	uid_t uid = 0;
+
+	if (!flow_build_tuple(skb, tuple, true))
+		return 0;
+	hash = jhash(tuple, REKERNEL_FLOW_TUPLE_LEN, 0);
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(rekernel_flow_map, e, hnode, hash) {
+		if (memcmp(e->tuple, tuple, REKERNEL_FLOW_TUPLE_LEN) == 0) {
+			uid = e->uid;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return uid;
+}
+
+/* 1 秒定时器顺带清理过期流表项 */
+static void flow_sweep(void)
+{
+	struct flow_entry *e;
+	struct hlist_node *tmp;
+	int bkt;
+
+	spin_lock_bh(&rekernel_flow_lock);
+	hash_for_each_safe(rekernel_flow_map, bkt, tmp, e, hnode) {
+		if (time_after(jiffies, e->expires)) {
+			hash_del(&e->hnode);
+			atomic_dec(&rekernel_flow_cnt);
+			kfree_rcu(e, rcu);
+		}
+	}
+	spin_unlock_bh(&rekernel_flow_lock);
 }
 
 static inline uid_t line_sock2uid(struct sock *sk)
@@ -233,10 +428,25 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
    return NF_ACCEPT;
 
   sk = skb_to_full_sk(socket_buffer);
-  if (sk == NULL || !sk_fullsock(sk))
+  if (sk != NULL && sk_fullsock(sk)) {
+   uid = line_sock2uid(sk);
+   /* 出向一定有 socket：顺手学一下 5 元组，供入向兜底 */
+   if (uid >= MIN_USERAPP_UID && NF_INET_LOCAL_OUT == state->hook)
+    flow_record(socket_buffer, uid);
+  } else if (NF_INET_LOCAL_IN == state->hook) {
+   /* 入向 socket 没挂上（未 connect 的 UDP/QUIC 很常见），按出向学到的流归属 */
+   uid = flow_lookup_uid(socket_buffer);
+   if (uid < MIN_USERAPP_UID) {
+    if (debug_unresolved && time_after(jiffies, last_unresolved_log + 5 * HZ)) {
+     last_unresolved_log = jiffies;
+     pr_info("[Re-Kernel LKM] inbound unresolved proto=%u\n",
+      ip_hdr(socket_buffer)->protocol);
+    }
+    return NF_ACCEPT;
+   }
+  } else {
    return NF_ACCEPT;
-
-  uid = line_sock2uid(sk);
+  }
   if (uid < MIN_USERAPP_UID) return NF_ACCEPT;
 
   /* 每个 uid 可以由订阅携带各自的阈值；未携带(0)时回落到模块参数 */
