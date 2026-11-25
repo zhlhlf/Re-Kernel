@@ -35,7 +35,20 @@ struct uid_info {
 
 static DEFINE_MUTEX(rekernel_net_uid_mutex);
 
-static struct uid_info *net_uid_find(uid_t uid)
+/* 调用者需持有 rekernel_net_uid_mutex */
+static struct uid_info *net_uid_find_locked(uid_t uid)
+{
+	struct uid_info *entry;
+
+	hash_for_each_possible(rekernel_net_uid_map, entry, hnode, uid) {
+		if (entry->uid == uid)
+			return entry;
+	}
+	return NULL;
+}
+
+/* 调用者需持有 rcu_read_lock */
+static struct uid_info *net_uid_find_rcu(uid_t uid)
 {
 	struct uid_info *entry;
 
@@ -53,7 +66,7 @@ bool net_uid_thresholds(uid_t uid, unsigned int *min_payload, unsigned int *min_
 	bool found = false;
 
 	rcu_read_lock();
-	entry = net_uid_find(uid);
+	entry = net_uid_find_rcu(uid);
 	if (entry) {
 		if (min_payload)
 			*min_payload = READ_ONCE(entry->min_payload);
@@ -71,7 +84,7 @@ void net_uid_add(uid_t uid, unsigned int min_payload, unsigned int min_payload_u
 	struct uid_info *entry;
 
 	mutex_lock(&rekernel_net_uid_mutex);
-	entry = net_uid_find(uid);
+	entry = net_uid_find_locked(uid);
 	if (entry) {
 		WRITE_ONCE(entry->min_payload, min_payload);
 		WRITE_ONCE(entry->min_payload_udp, min_payload_udp);
