@@ -47,15 +47,23 @@ bool rekernel_netlink_ready(void)
 static int rekernel_genl_add_monitor_net(struct sk_buff *skb, struct genl_info *info)
 {
 	uid_t muid;
+	unsigned int min_payload = 0;
+	unsigned int min_payload_udp = 0;
 
 	if (!info->attrs[REKERNEL_A_UID])
 		return -EINVAL;
 
 	muid = (uid_t)nla_get_u32(info->attrs[REKERNEL_A_UID]);
+	/* 可选：订阅同时携带该 uid 的 TCP/UDP 报文阈值，0 表示沿用模块默认 */
+	if (info->attrs[REKERNEL_A_MIN_PAYLOAD])
+		min_payload = nla_get_u32(info->attrs[REKERNEL_A_MIN_PAYLOAD]);
+	if (info->attrs[REKERNEL_A_MIN_PAYLOAD_UDP])
+		min_payload_udp = nla_get_u32(info->attrs[REKERNEL_A_MIN_PAYLOAD_UDP]);
 #ifdef DEBUG
-	pr_info("Re-Kernel monitorNet uid=%d\n", muid);
+	pr_info("Re-Kernel monitorNet uid=%d tcp=%u udp=%u\n",
+		muid, min_payload, min_payload_udp);
 #endif
-	net_uid_add(muid);
+	net_uid_add(muid, min_payload, min_payload_udp);
 	return 0;
 }
 
@@ -106,6 +114,8 @@ static const struct nla_policy rekernel_genl_policy[REKERNEL_A_MAX + 1] = {
 	[REKERNEL_A_MSG] = { .type = NLA_NUL_STRING, .len = PACKET_SIZE - 1 },
 	[REKERNEL_A_UID] = { .type = NLA_U32 },
 	[REKERNEL_A_PID] = { .type = NLA_U32 },
+	[REKERNEL_A_MIN_PAYLOAD] = { .type = NLA_U32 },
+	[REKERNEL_A_MIN_PAYLOAD_UDP] = { .type = NLA_U32 },
 };
 
 static const struct genl_ops rekernel_genl_ops[] = {
@@ -250,7 +260,7 @@ static void netlink_rcv_msg(struct sk_buff *socket_buffer)
 		if (cmd->type == REKERNEL_CMD_DEL_MONITOR_NET)
 			net_uid_del(muid);
 		else
-			net_uid_add(muid);
+			net_uid_add(muid, 0, 0); /* 旧协议不带阈值，用模块默认 */
 		break;
 	}
 	default:

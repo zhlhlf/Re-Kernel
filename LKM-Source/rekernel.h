@@ -2,7 +2,7 @@
 #define REKERNEL_H
 
 /* Re:Kernel version, single source of truth (used in logs and the version query). */
-#define REKERNEL_MAJOR_VERSION                "11.8-sub2"
+#define REKERNEL_MAJOR_VERSION                "11.9-sub"
 #define CLEAN_UP_ASYNC_BINDER
 
 #define MIN_USERAPP_UID                 (10000)
@@ -61,6 +61,8 @@ enum rekernel_genl_attr {
 	REKERNEL_A_MSG,   /* string: event payload in the legacy "key=value,...;" format */
 	REKERNEL_A_UID,   /* u32: uid to monitor for MONITOR_NET */
 	REKERNEL_A_PID,   /* u32: pid */
+	REKERNEL_A_MIN_PAYLOAD,     /* u32: per-uid TCP payload threshold, 0 = module default */
+	REKERNEL_A_MIN_PAYLOAD_UDP, /* u32: per-uid UDP payload threshold, 0 = module default */
 	__REKERNEL_A_MAX,
 };
 #define REKERNEL_A_MAX (__REKERNEL_A_MAX - 1)

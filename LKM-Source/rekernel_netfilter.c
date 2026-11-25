@@ -27,31 +27,65 @@
 static DEFINE_HASHTABLE(rekernel_net_uid_map, REKERNEL_NET_UID_HASH_BITS);
 struct uid_info {
 	uid_t uid;
+	unsigned int min_payload;      /* 0 = 用模块默认 */
+	unsigned int min_payload_udp;  /* 0 = 用模块默认 */
 	struct hlist_node hnode;
 	struct rcu_head rcu;
 };
 
 static DEFINE_MUTEX(rekernel_net_uid_mutex);
 
-static bool net_uid_monitored(uid_t uid)
+static struct uid_info *net_uid_find(uid_t uid)
 {
 	struct uid_info *entry;
 
 	hash_for_each_possible_rcu(rekernel_net_uid_map, entry, hnode, uid) {
 		if (entry->uid == uid)
-			return true;
+			return entry;
 	}
-	return false;
+	return NULL;
 }
 
-/* add a uid to the monitor map (no-op if already present). Caller must NOT hold the mutex. */
-void net_uid_add(uid_t uid)
+static bool net_uid_monitored(uid_t uid)
 {
+	return net_uid_find(uid) != NULL;
+}
+
+/* 取某个 uid 的阈值；未订阅返回 false。0 表示用模块默认值。 */
+bool net_uid_thresholds(uid_t uid, unsigned int *min_payload, unsigned int *min_payload_udp)
+{
+	struct uid_info *entry;
+	bool found = false;
+
+	rcu_read_lock();
+	entry = net_uid_find(uid);
+	if (entry) {
+		if (min_payload)
+			*min_payload = READ_ONCE(entry->min_payload);
+		if (min_payload_udp)
+			*min_payload_udp = READ_ONCE(entry->min_payload_udp);
+		found = true;
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+/* add a uid to the monitor map. 已存在时更新阈值（重复订阅即更新语义）。 */
+void net_uid_add(uid_t uid, unsigned int min_payload, unsigned int min_payload_udp)
+{
+	struct uid_info *entry;
+
 	mutex_lock(&rekernel_net_uid_mutex);
-	if (!net_uid_monitored(uid)) {
-		struct uid_info *entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	entry = net_uid_find(uid);
+	if (entry) {
+		WRITE_ONCE(entry->min_payload, min_payload);
+		WRITE_ONCE(entry->min_payload_udp, min_payload_udp);
+	} else {
+		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 		if (entry) {
 			entry->uid = uid;
+			entry->min_payload = min_payload;
+			entry->min_payload_udp = min_payload_udp;
 			hash_add_rcu(rekernel_net_uid_map, &entry->hnode, uid);
 		}
 	}
@@ -108,6 +142,8 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
   int data_len;
   int l4proto;
   bool monitored = false;
+  unsigned int uid_min_payload = 0;
+  unsigned int uid_min_payload_udp = 0;
 
   if (!socket_buffer || !socket_buffer->len || !state)
    return NF_ACCEPT;
@@ -132,10 +168,9 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
   uid = line_sock2uid(sk);
   if (uid < MIN_USERAPP_UID) return NF_ACCEPT;
 
+  /* 每个 uid 可以由订阅携带各自的阈值；未携带(0)时回落到模块参数 */
   if (!monitor_all) {
-   rcu_read_lock();
-   monitored = net_uid_monitored(uid);
-   rcu_read_unlock();
+   monitored = net_uid_thresholds(uid, &uid_min_payload, &uid_min_payload_udp);
    if (!monitored) return NF_ACCEPT;
   }
 
@@ -208,7 +243,9 @@ static unsigned int rekernel_pkg_ipv4_ipv6(void *priv, struct sk_buff *socket_bu
 
   /* 纯 ACK/握手（无 payload）不报；同时按协议各自的阈值过滤小包，避免刷屏 */
   {
-   unsigned int minp = (l4proto == IPPROTO_UDP) ? min_payload_udp : min_payload;
+   unsigned int minp = (l4proto == IPPROTO_UDP)
+       ? (uid_min_payload_udp ? uid_min_payload_udp : min_payload_udp)
+       : (uid_min_payload ? uid_min_payload : min_payload);
    if (data_len <= 0 || (minp && (unsigned int)data_len < minp))
     return NF_ACCEPT;
   }
